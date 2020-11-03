@@ -23,35 +23,31 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"strings"
 
 	"golang.org/x/crypto/openpgp"
 	"golang.org/x/crypto/openpgp/armor"
 	"golang.org/x/crypto/openpgp/clearsign"
 	"golang.org/x/crypto/openpgp/packet"
-
-	grafeas "github.com/Grafeas/client-go/v1alpha1"
-
 	"k8s.io/api/admission/v1beta1"
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var (
-	grafeasUrl  string
+	grafeasURL  string
 	tlsCertFile string
 	tlsKeyFile  string
 )
 
 var (
-	notesPath       = "/v1alpha1/projects/image-signing/notes"
-	occurrencesPath = "/v1alpha1/projects/image-signing/occurrences"
+	notesPath       = "/v1beta1/projects/image-signing/notes"
+	occurrencesPath = "/v1beta1/projects/image-signing/occurrences"
 )
 
 func main() {
-	flag.StringVar(&grafeasUrl, "grafeas", "http://grafeas:8080", "The Grafeas server address")
-	flag.StringVar(&tlsCertFile, "tls-cert", "/etc/admission-controller/tls/cert.pem", "TLS certificate file.")
-	flag.StringVar(&tlsKeyFile, "tls-key", "/etc/admission-controller/tls/key.pem", "TLS key file.")
+	flag.StringVar(&grafeasURL, "grafeas", "http://grafeas:8080", "Grafeas URL")
+	flag.StringVar(&tlsCertFile, "tls-cert", "/etc/admission-controller/tls/cert.pem", "TLS certificate")
+	flag.StringVar(&tlsKeyFile, "tls-key", "/etc/admission-controller/tls/key.pem", "TLS key")
 	flag.Parse()
 
 	http.HandleFunc("/", admissionReviewHandler)
@@ -72,8 +68,6 @@ func admissionReviewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	log.Println(string(data))
-
 	ar := v1beta1.AdmissionReview{}
 	if err := json.Unmarshal(data, &ar); err != nil {
 		log.Println(err)
@@ -88,12 +82,15 @@ func admissionReviewHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Deny the request by default.
 	admissionResponse := v1beta1.AdmissionResponse{Allowed: false}
 	for _, container := range pod.Spec.Containers {
+		log.Println("There is a request to run", container.Image)
+
 		// Retrieve all occurrences.
 		// This call should be replaced by a filtered called based on
 		// the container image under review.
-		u := fmt.Sprintf("%s/%s", grafeasUrl, occurrencesPath)
+		u := fmt.Sprintf("%s/%s", grafeasURL, occurrencesPath)
 		resp, err := http.Get(u)
 		if err != nil {
 			log.Println(err)
@@ -110,46 +107,39 @@ func admissionReviewHandler(w http.ResponseWriter, r *http.Request) {
 		defer resp.Body.Close()
 
 		if resp.StatusCode != 200 {
-			log.Printf("non 200 status code: %d", resp.StatusCode)
+			log.Printf("Non-200 status code from Grafeas: %d", resp.StatusCode)
 			continue
 		}
 
-		occurrencesResponse := grafeas.ListOccurrencesResponse{}
+		occurrencesResponse := v1Beta1ListOccurrencesResponse{}
 		if err := json.Unmarshal(data, &occurrencesResponse); err != nil {
 			log.Println(err)
 			continue
 		}
+		log.Println("Occurrences:", len(occurrencesResponse.Occurrences))
+		log.Println("Searching for attestation occurrences that match", container.Image)
 
 		// Find a valid signature for the given container image.
 		match := false
 		for _, occurrence := range occurrencesResponse.Occurrences {
-			resourceUrl := occurrence.ResourceUrl
-			signature := occurrence.Attestation.PgpSignedAttestation.Signature
-			keyId := occurrence.Attestation.PgpSignedAttestation.PgpKeyId
-
-			log.Printf("Container Image: %s", container.Image)
-			log.Printf("ResourceUrl: %s", resourceUrl)
-			log.Printf("Signature: %s", signature)
-			log.Printf("KeyId: %s", keyId)
-
-			if container.Image != strings.TrimPrefix(resourceUrl, "https://") {
+			if container.Image != occurrence.Resource.Name {
 				continue
 			}
-
+			log.Println("Found an occurrence of this image. Checking signatures.")
 			match = true
 
-			s, err := base64.StdEncoding.DecodeString(signature)
+			attestation := occurrence.Attestation.Attestation.PgpSignedAttestation
+			s, err := base64.StdEncoding.DecodeString(attestation.Signature)
 			if err != nil {
 				log.Println(err)
 				continue
 			}
 
-			publicKey := fmt.Sprintf("/etc/admission-controller/pubkeys/%s.pub", keyId)
-			log.Printf("Using public key: %s", publicKey)
-
-			f, err := os.Open(publicKey)
+			log.Printf("Using public key ID: %s", attestation.PgpKeyID)
+			publicKeyIDFile := fmt.Sprintf("/etc/admission-controller/pubkeys/%s.pub", attestation.PgpKeyID)
+			f, err := os.Open(publicKeyIDFile)
 			if err != nil {
-				log.Println(err)
+				log.Println("Unable to open file:", publicKeyIDFile)
 				continue
 			}
 
